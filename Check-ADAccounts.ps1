@@ -70,7 +70,7 @@ $results = foreach ($row in $rowArray) {
                    -Status "$counter / $total" `
                    -PercentComplete ($counter / $total * 100)
 
-    $raw = [string]$row.SamAccountName
+    $raw = ([string]$row.SamAccountName).Trim()
 
     if ($raw.ToLower().EndsWith($Suffix.ToLower())) {
         $samToCheck = $raw.Substring(0, $raw.Length - $Suffix.Length)
@@ -80,13 +80,9 @@ $results = foreach ($row in $rowArray) {
 
     $exists = $false
     if (-not [string]::IsNullOrWhiteSpace($samToCheck)) {
-        try {
-            $null = Get-ADUser -Identity $samToCheck -ErrorAction Stop
-            $exists = $true
-        } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-            $exists = $false
-        }
-        # All other AD exceptions (network, permissions) propagate and stop the script.
+        # -Filter returns $null when not found; avoids exception-type wrapping issues
+        # that occur with -Identity + -ErrorAction Stop across AD module versions.
+        $exists = $null -ne (Get-ADUser -Filter "SamAccountName -eq '$samToCheck'")
     }
 
     $row | Add-Member -NotePropertyName 'Exists in AD' -NotePropertyValue $exists -Force -PassThru
