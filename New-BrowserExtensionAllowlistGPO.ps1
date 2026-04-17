@@ -92,7 +92,8 @@ foreach ($col in @('Browser', 'Extension ID')) {
 }
 
 $grouped = $rowArray |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_.'Extension ID') } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_.'Extension ID') -and
+                   -not [string]::IsNullOrWhiteSpace($_.'Browser') } |
     Group-Object { $_.'Browser'.Trim() }
 
 if (-not $grouped) {
@@ -124,18 +125,42 @@ foreach ($group in $grouped) {
 
     Write-Host "`n[$cfgKey] $($ids.Count) extension(s) — GPO: '$gpoName'"
 
+    # Track whether GPO is ready for registry writes.
+    # In -WhatIf mode ShouldProcess returns $false but we still proceed to show
+    # what registry values would be set. With -Confirm and user declines, we skip.
+    $gpoReady = $false
     if ($PSCmdlet.ShouldProcess($gpoName, 'Create GPO')) {
         if (Get-GPO -Name $gpoName -Domain $Domain -ErrorAction SilentlyContinue) {
-            Write-Warning "  GPO '$gpoName' already exists — registry values will be overwritten."
+            Write-Warning "  GPO '$gpoName' already exists — stale entries will be cleared before rewriting."
         } else {
             $null = New-GPO -Name $gpoName -Domain $Domain
             Write-Host "  GPO created (unlinked)."
         }
+        $gpoReady = $true
+    } elseif ($WhatIfPreference) {
+        $gpoReady = $true
+    }
+
+    if (-not $gpoReady) {
+        Write-Warning "  GPO creation declined — skipping registry writes for '$gpoName'."
+        continue
     }
 
     switch ($cfg.Mode) {
 
         'Indexed' {
+            # Remove stale entries left from previous runs before writing fresh values.
+            if ($PSCmdlet.ShouldProcess("$cfgKey existing allowlist entries", 'Remove-GPRegistryValue')) {
+                $existing = Get-GPRegistryValue -Name $gpoName -Domain $Domain `
+                    -Key $cfg.RegistryKey -ErrorAction SilentlyContinue
+                if ($existing) {
+                    @($existing) | ForEach-Object {
+                        Remove-GPRegistryValue -Name $gpoName -Domain $Domain `
+                            -Key $cfg.RegistryKey -ValueName $_.ValueName | Out-Null
+                    }
+                }
+            }
+
             # Chrome / Edge: numbered REG_SZ values (1, 2, 3 ...) under the allowlist key.
             $index = 1
             foreach ($id in $ids) {
@@ -148,7 +173,9 @@ foreach ($group in $grouped) {
                 }
                 $index++
             }
-            Write-Host "  Wrote $($ids.Count) allowlist entr$(if ($ids.Count -eq 1) { 'y' } else { 'ies' })."
+            if (-not $WhatIfPreference) {
+                Write-Host "  Wrote $($ids.Count) allowlist entr$(if ($ids.Count -eq 1) { 'y' } else { 'ies' })."
+            }
         }
 
         'Json' {
@@ -170,7 +197,9 @@ foreach ($group in $grouped) {
                     -Type      String `
                     -Value     $json | Out-Null
             }
-            Write-Host "  Wrote ExtensionSettings JSON: block-all + $($ids.Count) allowed extension(s)."
+            if (-not $WhatIfPreference) {
+                Write-Host "  Wrote ExtensionSettings JSON: block-all + $($ids.Count) allowed extension(s)."
+            }
             Write-Warning "  ACTION REQUIRED: disable your existing Firefox blocking GPO — it conflicts with '$gpoName' on the ExtensionSettings key."
         }
     }
