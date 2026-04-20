@@ -160,7 +160,7 @@ foreach ($group in $grouped) {
     $gpoReady = $false
     if ($PSCmdlet.ShouldProcess($gpoName, 'Create GPO')) {
         if (Get-GPO -Name $gpoName -Domain $Domain -ErrorAction SilentlyContinue) {
-            Write-Warning "  GPO '$gpoName' already exists — stale entries will be cleared before rewriting."
+            Write-Error "GPO '$gpoName' already exists. Delete it first or choose a different -Environment value."
         } else {
             $null = New-GPO -Name $gpoName -Domain $Domain
             Write-Host "  GPO created (unlinked)."
@@ -193,19 +193,6 @@ foreach ($group in $grouped) {
             # is also applied. Without it, all extensions are already allowed and this GPO is a no-op.
             Write-Host "  Mixed policy model: blocklist (*) + allowlist (specific IDs) — no key conflict."
             Write-Warning "  ${cfgKey}: this allowlist only has effect if a separate GPO sets ExtensionInstallBlocklist = *. Without it, all extensions are already allowed."
-
-            # Remove stale entries left from previous runs before writing fresh values.
-            # Read is outside ShouldProcess so -WhatIf can enumerate what would be removed.
-            $existing = Get-GPRegistryValue -Name $gpoName -Domain $Domain `
-                -Key $cfg.RegistryKey -ErrorAction SilentlyContinue
-            if ($existing) {
-                @($existing) | ForEach-Object {
-                    if ($PSCmdlet.ShouldProcess("$cfgKey stale entry '$($_.ValueName) = $($_.Value)'", 'Remove-GPRegistryValue')) {
-                        Remove-GPRegistryValue -Name $gpoName -Domain $Domain `
-                            -Key $cfg.RegistryKey -ValueName $_.ValueName | Out-Null
-                    }
-                }
-            }
 
             # Chrome / Edge: numbered REG_SZ values (1, 2, 3 ...) under the allowlist key.
             $index = 1
