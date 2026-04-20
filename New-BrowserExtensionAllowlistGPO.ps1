@@ -189,7 +189,10 @@ foreach ($group in $grouped) {
             # Chrome / Edge: allowlist key is SEPARATE from the blocklist key.
             # ExtensionInstallBlocklist (*) and ExtensionInstallAllowlist coexist without conflict —
             # Chrome/Edge explicitly exempts allowlisted IDs from the blocklist.
+            # The allowlist is only effective when a blocking GPO with ExtensionInstallBlocklist = *
+            # is also applied. Without it, all extensions are already allowed and this GPO is a no-op.
             Write-Host "  Mixed policy model: blocklist (*) + allowlist (specific IDs) — no key conflict."
+            Write-Warning "  ${cfgKey}: this allowlist only has effect if a separate GPO sets ExtensionInstallBlocklist = *. Without it, all extensions are already allowed."
 
             # Remove stale entries left from previous runs before writing fresh values.
             # Read is outside ShouldProcess so -WhatIf can enumerate what would be removed.
@@ -240,11 +243,13 @@ foreach ($group in $grouped) {
             catch { Write-Error "Firefox ExtensionSettings JSON is invalid — aborting write for '$gpoName': $_" }
 
             if ($PSCmdlet.ShouldProcess("$cfgKey ExtensionSettings JSON", 'Set-GPRegistryValue')) {
+                # Mozilla documents ExtensionSettings as REG_MULTI_SZ on Windows GPO.
+                # Value is a single-element array; Firefox concatenates all elements into one JSON string.
                 Set-GPRegistryValue -Name $gpoName -Domain $Domain `
                     -Key       $cfg.RegistryKey `
                     -ValueName $cfg.ValueName `
-                    -Type      String `
-                    -Value     $json | Out-Null
+                    -Type      MultiString `
+                    -Value     @($json) | Out-Null
             }
             if (-not $WhatIfPreference) {
                 Write-Host "  Wrote ExtensionSettings JSON (REG_SZ): block-all + $($validIds.Count) allowed extension(s)."
