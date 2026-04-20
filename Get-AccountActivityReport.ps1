@@ -40,8 +40,9 @@
     Event 2889 is LDAP-specific but requires LDAP Interface Events logging to be enabled on each DC.
 
     Required Graph API permissions (app registration):
-      - AuditLog.Read.All   — read signInActivity on user objects
-      - User.Read.All       — read user objects and employeeType
+      - AuditLog.Read.All    — read signInActivity on user objects
+      - User.Read.All        — read user objects and employeeType
+      - Directory.Read.All   — read directory objects and onPremisesSamAccountName
 
     Required on-premises permissions:
       - Active Directory:   Domain Users read access is sufficient for Get-ADUser and
@@ -134,17 +135,16 @@ $uri = ("https://graph.microsoft.com/v1.0/users" +
 do {
     $page = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject
     foreach ($u in $page.value) {
-        # Only include sign-in timestamps that fall within the lookback window.
-        $interactiveTs = $null
+        # signInActivity timestamps are the all-time last seen — not windowed by DaysBack.
+        # DaysBack applies only to on-prem DC event log queries.
+        $interactiveTs    = $null
         $nonInteractiveTs = $null
         if ($u.signInActivity) {
-            if ($u.signInActivity.lastSignInDateTime) {
-                $ts = [datetime]$u.signInActivity.lastSignInDateTime
-                if ($ts -ge $since) { $interactiveTs = $ts }
+            if ($u.signInActivity.lastSuccessfulSignInDateTime) {
+                $interactiveTs = [datetime]$u.signInActivity.lastSuccessfulSignInDateTime
             }
             if ($u.signInActivity.lastNonInteractiveSignInDateTime) {
-                $ts = [datetime]$u.signInActivity.lastNonInteractiveSignInDateTime
-                if ($ts -ge $since) { $nonInteractiveTs = $ts }
+                $nonInteractiveTs = [datetime]$u.signInActivity.lastNonInteractiveSignInDateTime
             }
         }
 
@@ -240,12 +240,12 @@ if ($samNames.Count -eq 0) {
                     }
             } catch { Write-Warning "  4768 batch failed on '$dc': $_" }
 
-            # 4776 — NTLM credential validation; Properties[1] = LogonAccount
+            # 4776 — NTLM credential validation; Properties[1] = TargetUserName
             # Status='0x0' filters to successful authentications only — failed attempts are excluded.
             try {
                 $xp = ("*[System[(EventID=4776) and TimeCreated[@SystemTime>='$sinceXml']]] and " +
                        "*[EventData[Data[@Name='Status']='0x0']] and " +
-                       "*[EventData[" + (Build-AccountXPath $batch 'LogonAccount') + "]]")
+                       "*[EventData[" + (Build-AccountXPath $batch 'TargetUserName') + "]]")
                 Get-WinEvent -ComputerName $dc -LogName Security -FilterXPath $xp -ErrorAction SilentlyContinue |
                     ForEach-Object {
                         $key = ([string]$_.Properties[1].Value).ToLower()
