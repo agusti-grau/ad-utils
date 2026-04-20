@@ -39,7 +39,15 @@
     standard Windows event that distinguishes LDAP/LDAPS from other network protocols.
     Event 2889 is LDAP-specific but requires LDAP Interface Events logging to be enabled on each DC.
 
-    Required Graph API permissions: AuditLog.Read.All, User.Read.All
+    Required Graph API permissions (app registration):
+      - AuditLog.Read.All   — read signInActivity on user objects
+      - User.Read.All       — read user objects and employeeType
+
+    Required on-premises permissions:
+      - Active Directory:   Domain Users read access is sufficient for Get-ADUser and
+                            Get-ADDomainController (LastLogon is readable by default)
+      - DC Event Logs:      the account running this script must be a member of the
+                            'Event Log Readers' built-in group on every DC (or Domain Admin)
 
 .EXAMPLE
     .\Get-AccountActivityReport.ps1 `
@@ -85,7 +93,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $since    = (Get-Date).AddDays(-$DaysBack).ToUniversalTime()
-$sinceStr = $since.ToString("yyyy-MM-ddTHH:mm:ssZ")
 $sinceXml = $since.ToString("yyyy-MM-ddTHH:mm:ss.000Z")
 
 if (-not $OutputPath) {
@@ -116,21 +123,38 @@ Write-Host "Fetching users where $graphFilter ..."
 $userMap = @{}   # userId (GUID) → activity record
 $samMap  = @{}   # samAccountName (lowercase) → activity record
 
+# signInActivity returns lastSignInDateTime (interactive) and lastNonInteractiveSignInDateTime
+# directly on the user object — no need to page through audit log sign-in events separately.
+# Requires AuditLog.Read.All on the app registration.
 $uri = ("https://graph.microsoft.com/v1.0/users" +
         "?`$filter=$graphFilter" +
-        "&`$select=id,userPrincipalName,displayName,employeeType,onPremisesSamAccountName" +
+        "&`$select=id,userPrincipalName,displayName,employeeType,onPremisesSamAccountName,signInActivity" +
         "&`$top=999")
 
 do {
     $page = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject
     foreach ($u in $page.value) {
+        # Only include sign-in timestamps that fall within the lookback window.
+        $interactiveTs = $null
+        $nonInteractiveTs = $null
+        if ($u.signInActivity) {
+            if ($u.signInActivity.lastSignInDateTime) {
+                $ts = [datetime]$u.signInActivity.lastSignInDateTime
+                if ($ts -ge $since) { $interactiveTs = $ts }
+            }
+            if ($u.signInActivity.lastNonInteractiveSignInDateTime) {
+                $ts = [datetime]$u.signInActivity.lastNonInteractiveSignInDateTime
+                if ($ts -ge $since) { $nonInteractiveTs = $ts }
+            }
+        }
+
         $record = @{
             SamAccountName                = $u.onPremisesSamAccountName
             UserPrincipalName             = $u.userPrincipalName
             DisplayName                   = $u.displayName
             EmployeeType                  = $u.employeeType
-            EntraInteractiveLastSignIn    = $null
-            EntraNonInteractiveLastSignIn = $null
+            EntraInteractiveLastSignIn    = $interactiveTs
+            EntraNonInteractiveLastSignIn = $nonInteractiveTs
             ADLastLogon                   = $null
             KerberosLastAuth              = $null
             NTLMLastAuth                  = $null
@@ -151,38 +175,6 @@ if ($userMap.Count -eq 0) {
 }
 
 Write-Host "  Found $($userMap.Count) account(s)."
-
-#endregion
-
-#region Graph — sign-ins (interactive + non-interactive)
-
-Write-Host "Fetching Entra ID sign-ins (last $DaysBack days)..."
-
-$signinUri = ("https://graph.microsoft.com/v1.0/auditLogs/signIns" +
-              "?`$filter=createdDateTime ge $sinceStr" +
-              "&`$select=userId,createdDateTime,signInEventTypes" +
-              "&`$top=999")
-
-$countInteractive = 0; $countNonInteractive = 0
-
-do {
-    $page = Invoke-MgGraphRequest -Uri $signinUri -Method GET -OutputType PSObject
-    foreach ($s in $page.value) {
-        if (-not $userMap.ContainsKey($s.userId)) { continue }
-        $record = $userMap[$s.userId]
-        $ts     = [datetime]$s.createdDateTime
-        if ($s.signInEventTypes -contains 'nonInteractiveUser') {
-            Update-MaxTimestamp $record 'EntraNonInteractiveLastSignIn' $ts
-            $countNonInteractive++
-        } else {
-            Update-MaxTimestamp $record 'EntraInteractiveLastSignIn' $ts
-            $countInteractive++
-        }
-    }
-    $signinUri = $page.'@odata.nextLink'
-} while ($signinUri)
-
-Write-Host "  Interactive sign-in events matched: $countInteractive. Non-interactive: $countNonInteractive."
 
 #endregion
 
@@ -249,8 +241,10 @@ if ($samNames.Count -eq 0) {
             } catch { Write-Warning "  4768 batch failed on '$dc': $_" }
 
             # 4776 — NTLM credential validation; Properties[1] = LogonAccount
+            # Status='0x0' filters to successful authentications only — failed attempts are excluded.
             try {
                 $xp = ("*[System[(EventID=4776) and TimeCreated[@SystemTime>='$sinceXml']]] and " +
+                       "*[EventData[Data[@Name='Status']='0x0']] and " +
                        "*[EventData[" + (Build-AccountXPath $batch 'LogonAccount') + "]]")
                 Get-WinEvent -ComputerName $dc -LogName Security -FilterXPath $xp -ErrorAction SilentlyContinue |
                     ForEach-Object {
@@ -287,9 +281,13 @@ if ($samNames.Count -eq 0) {
             $xp = "*[System[(EventID=2889) and TimeCreated[@SystemTime>='$sinceXml']]]"
             Get-WinEvent -ComputerName $dc -LogName 'Directory Service' -FilterXPath $xp -ErrorAction SilentlyContinue |
                 ForEach-Object {
-                    $dn  = [string]$_.Properties[1].Value
-                    $key = if ($dn -match '^CN=([^,]+)') { $Matches[1].ToLower() } else { $dn.ToLower() }
-                    if ($samMap.ContainsKey($key)) { Update-MaxTimestamp $samMap[$key] 'LDAPUnsignedLastBind' $_.TimeCreated }
+                    # Properties[1] is the account name; format varies: DN, UPN, or bare username.
+                    # CN from a DN may differ from SamAccountName — matched best-effort.
+                    $raw = [string]$_.Properties[1].Value
+                    $key = if     ($raw -match '^CN=([^,]+)')  { $Matches[1].ToLower() } `
+                           elseif ($raw -match '^([^@]+)@')    { $Matches[1].ToLower() } `
+                           else                                 { $raw.ToLower() }
+                    if ($key -and $samMap.ContainsKey($key)) { Update-MaxTimestamp $samMap[$key] 'LDAPUnsignedLastBind' $_.TimeCreated }
                 }
         } catch { Write-Warning "  2889 unavailable on '$dc' (diagnostic logging may not be enabled): $_" }
     }
