@@ -64,6 +64,29 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Extension ID validation patterns.
+# Chrome/Edge: exactly 32 lowercase letters a-p (CRX hash encoding).
+# Firefox:     {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} GUID  OR  name@domain.
+$idPatterns = @{
+    Chrome  = '^[a-p]{32}$'
+    Edge    = '^[a-p]{32}$'
+    Firefox = '^(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}|[a-zA-Z0-9._%-]+@[a-zA-Z0-9._-]+)$'
+}
+
+function Test-ExtensionIds {
+    param([string[]]$ids, [string]$browser, [string]$pattern)
+    $valid   = [System.Collections.Generic.List[string]]::new()
+    $invalid = [System.Collections.Generic.List[string]]::new()
+    foreach ($id in $ids) {
+        if ($id -match $pattern) { $valid.Add($id) }
+        else                     { $invalid.Add($id) }
+    }
+    if ($invalid.Count -gt 0) {
+        Write-Warning ("  $browser — $($invalid.Count) invalid extension ID(s) skipped: " + ($invalid -join ', '))
+    }
+    return $valid.ToArray()
+}
+
 $browserConfig = @{
     Chrome  = @{
         RegistryKey = 'HKLM\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist'
@@ -152,9 +175,22 @@ foreach ($group in $grouped) {
         continue
     }
 
+    # Validate IDs against the browser-specific pattern; skip invalid ones.
+    $validIds = Test-ExtensionIds -ids $ids -browser $cfgKey -pattern $idPatterns[$cfgKey]
+
+    if ($validIds.Count -eq 0) {
+        Write-Warning "  No valid extension IDs remain for $cfgKey after validation — skipping GPO write."
+        continue
+    }
+
     switch ($cfg.Mode) {
 
         'Indexed' {
+            # Chrome / Edge: allowlist key is SEPARATE from the blocklist key.
+            # ExtensionInstallBlocklist (*) and ExtensionInstallAllowlist coexist without conflict —
+            # Chrome/Edge explicitly exempts allowlisted IDs from the blocklist.
+            Write-Host "  Mixed policy model: blocklist (*) + allowlist (specific IDs) — no key conflict."
+
             # Remove stale entries left from previous runs before writing fresh values.
             # Read is outside ShouldProcess so -WhatIf can enumerate what would be removed.
             $existing = Get-GPRegistryValue -Name $gpoName -Domain $Domain `
@@ -170,7 +206,7 @@ foreach ($group in $grouped) {
 
             # Chrome / Edge: numbered REG_SZ values (1, 2, 3 ...) under the allowlist key.
             $index = 1
-            foreach ($id in $ids) {
+            foreach ($id in $validIds) {
                 if ($PSCmdlet.ShouldProcess("$cfgKey entry $index = '$id'", 'Set-GPRegistryValue')) {
                     Set-GPRegistryValue -Name $gpoName -Domain $Domain `
                         -Key       $cfg.RegistryKey `
@@ -181,7 +217,7 @@ foreach ($group in $grouped) {
                 $index++
             }
             if (-not $WhatIfPreference) {
-                Write-Host "  Wrote $($ids.Count) allowlist entr$(if ($ids.Count -eq 1) { 'y' } else { 'ies' })."
+                Write-Host "  Wrote $($validIds.Count) allowlist entr$(if ($validIds.Count -eq 1) { 'y' } else { 'ies' })."
             }
         }
 
@@ -189,13 +225,19 @@ foreach ($group in $grouped) {
             # Firefox: single ExtensionSettings JSON — block-all wildcard + per-extension allows.
             # This GPO is self-contained; disable the existing Firefox blocking GPO to avoid
             # conflicts since both write to the same HKLM\...\Firefox\ExtensionSettings value.
-            $settings = [ordered]@{
-                '*' = [ordered]@{ installation_mode = 'blocked' }
+            #
+            # JSON is built via [PSCustomObject] (not a piped hashtable) to guarantee PS 5.1
+            # produces a clean JSON object rather than a wrapped PSCustomObject serialization.
+            $jsonObj = [PSCustomObject]@{}
+            $jsonObj | Add-Member -NotePropertyName '*' -NotePropertyValue ([PSCustomObject]@{ installation_mode = 'blocked' })
+            foreach ($id in $validIds) {
+                $jsonObj | Add-Member -NotePropertyName $id -NotePropertyValue ([PSCustomObject]@{ installation_mode = 'allowed' })
             }
-            foreach ($id in $ids) {
-                $settings[$id] = [ordered]@{ installation_mode = 'allowed' }
-            }
-            $json = $settings | ConvertTo-Json -Compress -Depth 3
+            $json = $jsonObj | ConvertTo-Json -Compress -Depth 3
+
+            # Verify the produced JSON is parseable before writing.
+            try   { $null = $json | ConvertFrom-Json }
+            catch { Write-Error "Firefox ExtensionSettings JSON is invalid — aborting write for '$gpoName': $_" }
 
             if ($PSCmdlet.ShouldProcess("$cfgKey ExtensionSettings JSON", 'Set-GPRegistryValue')) {
                 Set-GPRegistryValue -Name $gpoName -Domain $Domain `
@@ -205,7 +247,7 @@ foreach ($group in $grouped) {
                     -Value     $json | Out-Null
             }
             if (-not $WhatIfPreference) {
-                Write-Host "  Wrote ExtensionSettings JSON: block-all + $($ids.Count) allowed extension(s)."
+                Write-Host "  Wrote ExtensionSettings JSON (REG_SZ): block-all + $($validIds.Count) allowed extension(s)."
             }
             Write-Warning "  ACTION REQUIRED: disable your existing Firefox blocking GPO — it conflicts with '$gpoName' on the ExtensionSettings key."
         }
