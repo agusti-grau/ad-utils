@@ -48,9 +48,16 @@ param (
     [string]$ExcelPath,
 
     [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
+    [ValidateScript({
+        if ($_ -notmatch '\.') { throw "Domain must be an FQDN (e.g. contoso.com), not a NetBIOS name." }
+        $true
+    })]
     [string]$Domain,
 
+    [ValidateScript({
+        if ($_ -match '[\\\/\[\]:;|=,+*?<>"&]') { throw "Environment contains characters that are invalid in a GPO name." }
+        $true
+    })]
     [string]$Environment = 'Test'
 )
 
@@ -87,7 +94,6 @@ $rowArray = @($rows)
 foreach ($col in @('Browser', 'Extension ID')) {
     if (-not ($rowArray[0].PSObject.Properties.Name -contains $col)) {
         Write-Error "Column '$col' not found in '$ExcelPath'."
-        exit 1
     }
 }
 
@@ -150,11 +156,12 @@ foreach ($group in $grouped) {
 
         'Indexed' {
             # Remove stale entries left from previous runs before writing fresh values.
-            if ($PSCmdlet.ShouldProcess("$cfgKey existing allowlist entries", 'Remove-GPRegistryValue')) {
-                $existing = Get-GPRegistryValue -Name $gpoName -Domain $Domain `
-                    -Key $cfg.RegistryKey -ErrorAction SilentlyContinue
-                if ($existing) {
-                    @($existing) | ForEach-Object {
+            # Read is outside ShouldProcess so -WhatIf can enumerate what would be removed.
+            $existing = Get-GPRegistryValue -Name $gpoName -Domain $Domain `
+                -Key $cfg.RegistryKey -ErrorAction SilentlyContinue
+            if ($existing) {
+                @($existing) | ForEach-Object {
+                    if ($PSCmdlet.ShouldProcess("$cfgKey stale entry '$($_.ValueName) = $($_.Value)'", 'Remove-GPRegistryValue')) {
                         Remove-GPRegistryValue -Name $gpoName -Domain $Domain `
                             -Key $cfg.RegistryKey -ValueName $_.ValueName | Out-Null
                     }
